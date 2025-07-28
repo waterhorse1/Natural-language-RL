@@ -281,8 +281,11 @@ def main():
     value_model.pretrained_model.config.pad_token_id = tokenizer.pad_token_id
 
     train_data = get_train_data(
-        "Breakthrough_dataset/train_10k/look_ahead/replay_buffer.jsonl"
+        "Breakthrough_dataset/train_45k/look_ahead/replay_buffer.jsonl"
     )
+    import numpy as np
+    np.random.seed(42)  # 设置随机种子以确保可重复性
+    train_data = np.random.choice(train_data, size=1e4, replace=False)
     subsequent_states = [
         data["final_state"]
         for data in train_data
