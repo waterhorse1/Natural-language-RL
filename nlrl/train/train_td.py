@@ -10,7 +10,8 @@ from transformers import (
     TrainingArguments,
     Trainer,
 )
-
+import numpy as np
+np.random.seed(42)  # 设置随机种子以确保可重复性
 # 从 trl 库导入我们需要的模型
 from trl import AutoModelForCausalLMWithValueHead
 
@@ -40,6 +41,7 @@ def read_jsonl(file_path):
 
 def get_train_data(file_path):
     train_data = read_jsonl(file_path)
+    train_data = np.random.choice(train_data, size=int(1e4), replace=False)
     transitions = []
     for data in train_data:
         state = data["current_state"]
@@ -271,7 +273,8 @@ def compute_eval_metrics(eval_pred):
 
 
 def main():
-    MODEL_NAME = "distilgpt2"
+    # MODEL_NAME = "distilgpt2"
+    MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
     value_model = AutoModelForCausalLMWithValueHead.from_pretrained(MODEL_NAME)
     tokenizer = AutoTokenizer.from_pretrained(
         MODEL_NAME,
@@ -279,19 +282,18 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     value_model.pretrained_model.config.pad_token_id = tokenizer.pad_token_id
+    value_model = value_model.to(torch.bfloat16)
 
     train_data = get_train_data(
         "Breakthrough_dataset/train_45k/look_ahead/replay_buffer.jsonl"
     )
-    import numpy as np
-    np.random.seed(42)  # 设置随机种子以确保可重复性
-    train_data = np.random.choice(train_data, size=1e4, replace=False)
     subsequent_states = [
         data["final_state"]
         for data in train_data
         if data["final_state"][0] != TERMINAL_STATE
     ]
     print(f"Eval prompt: {EVAL_PROMPT}")
+    print(f"Number of training data: {len(train_data)}")
     print(f"Number of subsequent states: {len(subsequent_states)}")
     for train_iter in range(50):
         training_args = TrainingArguments(
@@ -307,6 +309,10 @@ def main():
             save_strategy="no",
             remove_unused_columns=False,
             save_safetensors=False,
+            fsdp="full_shard auto_wrap",
+            fsdp_transformer_layer_cls_to_wrap="LlamaDecoderLayer",
+            bf16=True,
+            bf16_full_eval=True,
         )
         trainer = RegressionTrainer(
             model=value_model,
