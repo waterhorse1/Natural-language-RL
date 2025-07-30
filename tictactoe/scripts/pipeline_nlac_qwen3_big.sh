@@ -1,4 +1,5 @@
 #!/bin/bash
+
 set -ex
 export PYTHONPATH="$PWD:$PYTHONPATH"
 
@@ -39,7 +40,11 @@ fi
 echo $POLICY_CHECKPOINT
 
 SMALL_LLM_NAME=${SMALL_LLM_PATH:-"path/to/llama-3.1-8b"}
-BIG_LLM_NAME=${BIG_LLM_PATH:-"path/to/llama-3.1-70b"}
+BIG_LLM_NAME=${BIG_LLM_PATH:-"Qwen/Qwen3-8B"}
+
+QWEN3_TEMP=0.6
+QWEN3_TOP_K=20
+QWEN3_TOP_P=0.95
 
 if [[ $SMALL_LLM_NAME == *"qwen"* ]] || [[ $SMALL_LLM_NAME == *"Qwen"* ]]; then
     FSDP_TRANSFORMER_LAYER="Qwen2DecoderLayer"
@@ -77,14 +82,13 @@ do
     Q_TRAIN_PATH="${BASE_Q_TARGET_PATH}_for_train_${i}.jsonl"
     IMPROVE_TARGET_PATH="${BASE_IMPROVE_TARGET_PATH}_${i}.jsonl"
     IMPROVE_TRAIN_PATH="${BASE_IMPROVE_TARGET_PATH}_for_train_${i}.jsonl"
-    # Run rollout
+    
     python3 tictactoe/collect_rollout_data.py --policy_name $POLICY_NAME --opponent_policy_name $OPPONENT_POLICY_NAME --replay_buffer_path $REPLY_BUFFER_PATH --rollout_method scratch --num_rollouts $NUM_ROLLOUTS --model_path $ROLLOUT_POLICY_MODEL_PATH
-    # Run MC prompt
-    python3 tictactoe/prompt_llm.py --method mc_value_q --max_tokens=1024 --model_path $BIG_LLM_NAME --batch_size $BATCH_SIZE --input_path $REPLY_BUFFER_PATH --output_path $Q_TARGET_PATH --n_mc_trajs $N_MC_TRAJ
-    # Run format transfer
+    
+    python3 tictactoe/prompt_llm.py --method mc_value_q --max_tokens=4096 --model_path $BIG_LLM_NAME --batch_size $BATCH_SIZE --input_path $REPLY_BUFFER_PATH --output_path $Q_TARGET_PATH --n_mc_trajs $N_MC_TRAJ --temp $QWEN3_TEMP --top_k $QWEN3_TOP_K --top_p $QWEN3_TOP_P
+    
     python3 tictactoe/data_for_train.py --data_path $Q_TARGET_PATH --output_path $Q_TRAIN_PATH --method mc_value_q
 
-    # Iterate to generate all possible boards
     Q_TRAIN_PATH_MERGE="${BASE_Q_TARGET_PATH}_for_train_merged.jsonl"
     python3 tictactoe/merge_train_data.py --data_path $Q_TRAIN_PATH --output_path $Q_TRAIN_PATH_MERGE --history $NUM_HISTORY
     torchrun --nproc_per_node=8 --master_port=20002 tictactoe/train/train_sft.py \
@@ -119,8 +123,9 @@ do
     VALUE_CHECKPOINT=$(find $VALUE_MODEL_PATH -type d -name 'checkpoint*' | sort | head -n 1)
     rm -rf ${VALUE_CHECKPOINT}/rng*
     rm -rf ${VALUE_CHECKPOINT}/train*
-    # run improvement
-    python3 tictactoe/prompt_llm.py --method improve --max_tokens=1024 --model_path $BIG_LLM_NAME --batch_size $BATCH_SIZE --input_path $REPLY_BUFFER_PATH --output_path $IMPROVE_TARGET_PATH --value_model_path $VALUE_CHECKPOINT --policy_model_path $ROLLOUT_POLICY_MODEL_PATH --num_policy_sample $NUM_POLICY_SAMPLE --max_use_action $TOP_K_SAMPLE
+    
+    python3 tictactoe/prompt_llm.py --method improve --max_tokens=4096 --model_path $BIG_LLM_NAME --batch_size $BATCH_SIZE --input_path $REPLY_BUFFER_PATH --output_path $IMPROVE_TARGET_PATH --value_model_path $VALUE_CHECKPOINT --policy_model_path $ROLLOUT_POLICY_MODEL_PATH --num_policy_sample $NUM_POLICY_SAMPLE --max_use_action $TOP_K_SAMPLE --temp $QWEN3_TEMP --top_k $QWEN3_TOP_K --top_p $QWEN3_TOP_P
+    
     python3 tictactoe/data_for_train.py --data_path $IMPROVE_TARGET_PATH --output_path $IMPROVE_TRAIN_PATH --method improve
     torchrun --nproc_per_node=8 --master_port=20002 tictactoe/train/train_sft.py \
         --model_name_or_path=$SMALL_LLM_NAME \
@@ -155,7 +160,6 @@ do
     rm -rf ${POLICY_CHECKPOINT}/rng*
     rm -rf ${POLICY_CHECKPOINT}/train*
 
-    # remove old policy and old value model to save memory
     if [ $i -gt 1 ]; then
         rm -rf ${BASE_POLICY_MODEL_PATH}_$(($i-1))/checkpoint*
         rm -rf ${BASE_VALUE_MODEL_PATH}_$(($i-1))/checkpoint*
@@ -171,7 +175,6 @@ calculated_value=$((FINAL_ITERATION_NUM + 1))
 REPLY_BUFFER_PATH="${BASE_REPLAY_BUFFER_PATH}_${calculated_value}.jsonl"
 python3 tictactoe/collect_rollout_data.py --policy_name $POLICY_NAME --opponent_policy_name $OPPONENT_POLICY_NAME --replay_buffer_path $REPLY_BUFFER_PATH --rollout_method scratch --num_rollouts $NUM_ROLLOUTS --model_path $ROLLOUT_POLICY_MODEL_PATH
 
-# remove extra results
 rm $POLICY_CHECKPOINT/optimizer.bin
 rm $POLICY_CHECKPOINT/pytorch_model_fsdp.bin
 rm $VALUE_CHECKPOINT/optimizer.bin
