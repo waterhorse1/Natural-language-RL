@@ -40,7 +40,14 @@ class Agent:
                 sample_config=sample_config,
                 tensor_parallel_size=model_tp_size,
             )
-            self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+            if "qwen" in model_path.lower():
+                try:
+                    self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+                except Exception as e:
+                    print(f"Failed to load tokenizer with trust_remote_code, trying without fast: {e}")
+                    self.tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False, trust_remote_code=True)
+            else:
+                self.tokenizer = AutoTokenizer.from_pretrained(model_path)
         elif not self.remote:
             self.model = vllm_model(
                 model_path=self.model_path,

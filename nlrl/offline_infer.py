@@ -14,7 +14,7 @@ import ray.data
 from packaging.version import Version
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 import torch
-from nlrl.llm_call import llama3_instruct_format
+from nlrl.llm_call import llama3_instruct_format, qwen3_instruct_format, parse_qwen3_output
 from nlrl.config import LLMSamplingParams
 from transformers import AutoTokenizer
 from functools import partial
@@ -31,7 +31,7 @@ def offline_ray_vllm_infer(
     tensor_parallel_size: Optional[int],
     messages: List[List[Dict[str, str]]],
     sample_config: LLMSamplingParams,
-    prompt_format=llama3_instruct_format,
+    prompt_format=None,
 ):
     # Create a sampling params object.
     sampling_params = SamplingParams(
@@ -44,6 +44,13 @@ def offline_ray_vllm_infer(
     )
 
     assert sampling_params.n == 1
+    
+    is_qwen = "qwen" in model.lower()
+    if prompt_format is None:
+        if is_qwen:
+            prompt_format = qwen3_instruct_format
+        else:
+            prompt_format = llama3_instruct_format
 
     class LLMPredictor:
 
@@ -53,7 +60,16 @@ def offline_ray_vllm_infer(
                 model=model,
                 tensor_parallel_size=tensor_parallel_size,
                 disable_custom_all_reduce=True,
+                trust_remote_code=True if "qwen" in model.lower() else False,
             )
+            if "qwen" in model.lower():
+                try:
+                    self.tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+                except Exception as e:
+                    print(f"Failed to load tokenizer with trust_remote_code, trying without fast: {e}")
+                    self.tokenizer = AutoTokenizer.from_pretrained(model, use_fast=False, trust_remote_code=True)
+            else:
+                self.tokenizer = AutoTokenizer.from_pretrained(model)
 
         def __call__(self, batch: Dict[str, np.ndarray]) -> Dict[str, list]:
             outputs = self.llm.generate(batch["text"], sampling_params)
@@ -63,7 +79,10 @@ def offline_ray_vllm_infer(
             for i, output in enumerate(outputs):
                 indices.append(batch["i"][i])
                 prompt.append(output.prompt)
-                generated_text.append(output.outputs[0].text)
+                text = output.outputs[0].text
+                if is_qwen:
+                    text = parse_qwen3_output(text, self.tokenizer)
+                generated_text.append(text)
             return {
                 "i": indices,
                 "prompt": prompt,
@@ -73,7 +92,15 @@ def offline_ray_vllm_infer(
     # Set number of instances. Each instance will use tensor_parallel_size GPUs.
     num_instances = torch.cuda.device_count() // tensor_parallel_size
 
-    tokenizer = AutoTokenizer.from_pretrained(model)
+    if "qwen" in model.lower():
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+        except Exception as e:
+            print(f"Failed to load tokenizer with trust_remote_code, trying without fast: {e}")
+            tokenizer = AutoTokenizer.from_pretrained(model, use_fast=False, trust_remote_code=True)
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(model)
+        
     messages_with_idx = [
         {"i": i, "text": prompt_format(tokenizer=tokenizer, messages=d)}
         for i, d in enumerate(messages)

@@ -26,6 +26,29 @@ def llama3_instruct_format(tokenizer, messages):
         messages, add_generation_prompt=True, tokenize=False
     )
 
+def qwen3_instruct_format(tokenizer, messages):
+    return tokenizer.apply_chat_template(
+        messages, 
+        add_generation_prompt=True, 
+        tokenize=False,
+        enable_thinking=False
+    )
+
+def parse_qwen3_output(generated_text, tokenizer):
+    """Parse Qwen3 output to extract only the final content, ignoring thinking content."""
+    try:
+        token_ids = tokenizer.encode(generated_text, add_special_tokens=False)
+        
+        think_end_token = 151668
+        if think_end_token in token_ids:
+            think_end_idx = token_ids.index(think_end_token)
+            content_ids = token_ids[think_end_idx + 1:]
+            return tokenizer.decode(content_ids, skip_special_tokens=True).strip()
+        else:
+            return generated_text
+    except:
+        return generated_text
+
 class openai_model:
     def __init__(
         self,
@@ -66,7 +89,7 @@ class vllm_model:
         self,
         model_path: str,
         sample_config: LLMSamplingParams,
-        prompt_format: Any = llama3_instruct_format,
+        prompt_format: Any = None,
         tensor_parallel_size: int = None,
     ):
         self.sampling_params = SamplingParams(
@@ -77,22 +100,40 @@ class vllm_model:
             max_tokens=sample_config.max_tokens,
             prompt_logprobs=0,
         )
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+        if "qwen" in model_path.lower():
+            try:
+                self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+            except Exception as e:
+                print(f"Failed to load tokenizer with trust_remote_code, trying without fast: {e}")
+                self.tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False, trust_remote_code=True)
+        else:
+            self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+            
         self.llm = LLM(
             model=model_path,
             tokenizer=model_path,
             dtype="bfloat16",
             tensor_parallel_size=tensor_parallel_size or torch.cuda.device_count(),
             disable_custom_all_reduce=True,
+            trust_remote_code=True if "qwen" in model_path.lower() else False,
         )
+        
+        self.is_qwen = "qwen" in model_path.lower()
+        if prompt_format is None:
+            if self.is_qwen:
+                prompt_format = qwen3_instruct_format
+            else:
+                prompt_format = llama3_instruct_format
+        
         self.prompt_format = functools.partial(prompt_format, tokenizer=self.tokenizer)
 
     def generate(self, messages):
-        # Batched generation
         prompts = [self.prompt_format(messages=d) for d in messages]
         outputs = self.llm.generate(prompts, self.sampling_params)
         for output, message in zip(outputs, messages):
             generated_text = output.outputs[0].text
+            if self.is_qwen:
+                generated_text = parse_qwen3_output(generated_text, self.tokenizer)
             message.append({"role": "assistant", "content": generated_text})
         return messages, outputs
 
@@ -107,18 +148,34 @@ class RemoteVLLMModel:
         self,
         model_path: str,
         sample_config: LLMSamplingParams,
-        prompt_format: Any = llama3_instruct_format,
+        prompt_format: Any = None,
         tensor_parallel_size: int = None,
         host: str = "0.0.0.0",
         port: int = 8000,
     ):
-        self.prompt_format = prompt_format
         self.sample_config = sample_config
         self.model_path = model_path
         self.tensor_parallel_size = tensor_parallel_size or torch.cuda.device_count()
         self.port = port
         self.host = host
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+        if "qwen" in model_path.lower():
+            try:
+                self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+            except Exception as e:
+                print(f"Failed to load tokenizer with trust_remote_code, trying without fast: {e}")
+                self.tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False, trust_remote_code=True)
+        else:
+            self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+        
+        # Auto-detect prompt format based on model type
+        self.is_qwen = "qwen" in model_path.lower()
+        if prompt_format is None:
+            if self.is_qwen:
+                prompt_format = qwen3_instruct_format
+            else:
+                # Default to llama3 format for backward compatibility
+                prompt_format = llama3_instruct_format
+                
         self.prompt_format = functools.partial(prompt_format, tokenizer=self.tokenizer)
 
         self._build_remote_server()
@@ -130,7 +187,7 @@ class RemoteVLLMModel:
             "--model",
             self.model_path,
             "--tensor-parallel-size",
-            "4",
+            str(self.tensor_parallel_size),
             "--host",
             self.host,
             "--port",
@@ -203,8 +260,9 @@ class RemoteVLLMModel:
                     decoded_chunk = json.loads(chunk.decode("utf-8"))
                     generated_texts.extend(decoded_chunk["text"])
 
-        # Append the generated texts to messages
         for generated_text, message in zip(generated_texts, messages):
+            if self.is_qwen:
+                generated_text = parse_qwen3_output(generated_text, self.tokenizer)
             message.append({"role": "assistant", "content": generated_text})
         return messages
 
